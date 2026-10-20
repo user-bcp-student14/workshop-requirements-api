@@ -1,34 +1,111 @@
 from __future__ import annotations
 
-import base64
 import os
 import sqlite3
-import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+import jwt
 import urllib3
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from jwt import PyJWKClient
+from jwt.exceptions import (
+    InvalidTokenError,
+    PyJWKClientConnectionError,
+    PyJWKClientError,
+    PyJWKSetError,
+)
 
-LEGACY_SECRET = "WORKSHOP_SECRET_2026"
+TOKEN_ISSUER = "workshop-auth-backend"
+TOKEN_AUDIENCE = "workshop-requirements-api"
+JWKS_URL = "http://127.0.0.1:8080/auth/.well-known/jwks.json"
+MAX_UPLOAD_BYTES = 100
 
 
-def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
+class SigningKey(Protocol):
+    key: Any
+    key_id: str | None
+
+
+class JwksClient(Protocol):
+    def get_signing_keys(self, refresh: bool = False) -> list[SigningKey]: ...
+
+
+def verified_identity(
+    authorization: str,
+    jwks_client: JwksClient,
+    issuer: str,
+    audience: str,
+) -> dict[str, str]:
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not separator or not token:
+        raise HTTPException(status_code=401, detail="Invalid token")
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
-        parts = decoded.split("|")
-        if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
-            raise ValueError("invalid token")
-        return {"username": parts[0], "role": parts[1]}
-    except Exception as error:
-        raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
+        key_id = jwt.get_unverified_header(token).get("kid")
+        if not isinstance(key_id, str) or not key_id:
+            raise InvalidTokenError("missing key id")
+        signing_keys = jwks_client.get_signing_keys()
+        signing_key = next((key for key in signing_keys if key.key_id == key_id), None)
+        if signing_key is None:
+            signing_keys = jwks_client.get_signing_keys(refresh=True)
+            signing_key = next((key for key in signing_keys if key.key_id == key_id), None)
+        if signing_key is None:
+            raise InvalidTokenError("unknown key id")
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=audience,
+            issuer=issuer,
+            options={"require": ["exp", "iat", "sub", "iss", "aud", "role"]},
+        )
+        username = claims.get("sub")
+        role = claims.get("role")
+        if (
+            claims.get("aud") != audience
+            or claims.get("iss") != issuer
+            or not isinstance(username, str)
+            or not username
+            or not isinstance(role, str)
+            or not role
+        ):
+            raise InvalidTokenError("invalid identity claims")
+        return {"username": username, "role": role}
+    except PyJWKClientConnectionError as error:
+        raise HTTPException(status_code=503, detail="Token verification service unavailable") from error
+    except (PyJWKClientError, PyJWKSetError) as error:
+        raise HTTPException(status_code=503, detail="Token verification service unavailable") from error
+    except (InvalidTokenError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=401, detail="Invalid token") from error
 
 
-def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
+def valid_markdown_filename(filename: str | None) -> bool:
+    return bool(
+        filename
+        and filename not in {".", ".."}
+        and Path(filename).name == filename
+        and "/" not in filename
+        and "\\" not in filename
+        and "\x00" not in filename
+        and Path(filename).suffix.lower() == ".md"
+    )
+
+
+def create_app(
+    db_path: str | None = None,
+    upload_dir: str | None = None,
+    *,
+    jwks_client: JwksClient | None = None,
+    token_issuer: str = TOKEN_ISSUER,
+    token_audience: str = TOKEN_AUDIENCE,
+) -> FastAPI:
     selected_db = db_path or os.getenv("WORKSHOP_DB_PATH", "./data/workshop.db")
     selected_uploads = upload_dir or os.getenv("WORKSHOP_UPLOAD_DIR", "./uploads")
+    selected_jwks_url = os.getenv("AUTH_JWKS_URL", JWKS_URL)
+    selected_issuer = os.getenv("AUTH_TOKEN_ISSUER", token_issuer)
+    selected_audience = os.getenv("AUTH_TOKEN_AUDIENCE", token_audience)
+    selected_jwks_client = jwks_client or PyJWKClient(selected_jwks_url, timeout=3)
     Path(selected_db).parent.mkdir(parents=True, exist_ok=True)
     Path(selected_uploads).mkdir(parents=True, exist_ok=True)
 
@@ -45,6 +122,10 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
     app = FastAPI(title="Workshop Requirements API", version="0.1.0")
     app.state.connection = connection
     app.state.upload_dir = selected_uploads
+
+    def identity(authorization: str = Header(default="")) -> dict[str, str]:
+        return verified_identity(authorization, selected_jwks_client, selected_issuer, selected_audience)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -65,32 +146,46 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         }
 
     @app.get("/api/tasks")
-    def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> list[dict[str, Any]]:
-        requested_owner = owner or identity["username"]
-        sql = "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner='" + requested_owner + "' ORDER BY id"
-        rows = connection.execute(sql).fetchall()
+    def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(identity)) -> list[dict[str, Any]]:
+        requested_owner = identity["username"]
+        if owner is not None and owner != requested_owner:
+            raise HTTPException(status_code=403, detail="Not authorized to access this owner")
+        rows = connection.execute(
+            "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner=? ORDER BY id",
+            (requested_owner,),
+        ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             result.append(as_task(row))
         return result
 
     @app.post("/api/tasks", status_code=201)
-    def create_task(payload: dict[str, Any] = Body(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    def create_task(payload: dict[str, Any] = Body(...), identity: dict[str, str] = Depends(identity)) -> dict[str, Any]:
         title = str(payload.get("title", ""))
         description = str(payload.get("description", ""))
         status = str(payload.get("status", "TODO"))
         priority = str(payload.get("priority", "MEDIUM"))
         owner = str(payload.get("owner", identity["username"]))
-        sql = "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES ('" + title + "','" + description + "','" + status + "','" + owner + "','" + priority + "',datetime('now'))"
-        cursor = connection.execute(sql)
+        cursor = connection.execute(
+            "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES (?,?,?,?,?,datetime('now'))",
+            (title, description, status, owner, priority),
+        )
         connection.commit()
-        row = connection.execute("SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE id=" + str(cursor.lastrowid)).fetchone()
+        row = connection.execute(
+            "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE id=?",
+            (cursor.lastrowid,),
+        ).fetchone()
         return as_task(row)
 
     @app.get("/api/summary")
-    def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
-        requested_owner = owner or identity["username"]
-        rows = connection.execute("SELECT status,priority FROM tasks WHERE owner='" + requested_owner + "'").fetchall()
+    def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(identity)) -> dict[str, Any]:
+        requested_owner = identity["username"]
+        if owner is not None and owner != requested_owner:
+            raise HTTPException(status_code=403, detail="Not authorized to access this owner")
+        rows = connection.execute(
+            "SELECT status,priority FROM tasks WHERE owner=?",
+            (requested_owner,),
+        ).fetchall()
         response: dict[str, Any] = {"owner": requested_owner, "total": 0, "byStatus": {}, "highPriorityOpen": 0}
         for row in rows:
             response["total"] = response["total"] + 1
@@ -105,14 +200,22 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         return response
 
     @app.post("/api/requirements", status_code=201)
-    async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
-        target = Path(selected_uploads) / str(file.filename)
-        content = await file.read()
+    async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(identity)) -> dict[str, Any]:
+        filename = file.filename
+        if not valid_markdown_filename(filename):
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        target_directory = Path(selected_uploads).resolve()
+        target = Path(selected_uploads) / filename
+        if target.resolve().parent != target_directory:
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"File exceeds the {MAX_UPLOAD_BYTES}-byte limit")
         target.write_bytes(content)
-        return {"owner": identity["username"], "fileName": file.filename, "storedAt": str(target), "size": len(content)}
+        return {"owner": identity["username"], "fileName": filename, "storedAt": str(target), "size": len(content)}
 
     @app.get("/api/backend-health")
-    def backend_health(identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    def backend_health(identity: dict[str, str] = Depends(identity)) -> dict[str, Any]:
         url = os.getenv("AUTH_HEALTH_URL", "http://localhost:8080/q/health")
         try:
             response = urllib3.PoolManager().request("GET", url, timeout=3.0)
